@@ -133,6 +133,9 @@ class DimensionDataNodeDriver(NodeDriver):
                                                       region=region,
                                                       **kwargs)
 
+        # Cache locations (keyed by Id) to improve performance
+        self._location_cache = {}
+
     def _ex_connection_class_kwargs(self):
         """
             Add the region to the kwargs before the connection is instantiated
@@ -851,13 +854,18 @@ class DimensionDataNodeDriver(NodeDriver):
         if ex_id is not None:
             params['id'] = ex_id
 
-        return self._to_locations(
+        locations = self._to_locations(
             self.connection
             .request_with_orgId_api_2(
                 'infrastructure/datacenter',
                 params=params
             ).object
         )
+
+        if not ex_id:  # Only populate the cache if all locations are requested
+            self._populate_location_cache(locations)
+
+        return locations
 
     def list_networks(self, location=None):
         """
@@ -1472,10 +1480,10 @@ class DimensionDataNodeDriver(NodeDriver):
 
         :rtype: :class:`DimensionDataNetworkDomain`
         """
-        locations = self.list_locations()
+
         net = self.connection.request_with_orgId_api_2(
             'network/networkDomain/%s' % network_domain_id).object
-        return self._to_network_domain(net, locations)
+        return self._to_network_domain(net)
 
     def ex_list_network_domains(self, location=None, name=None,
                                 service_plan=None, state=None):
@@ -1673,10 +1681,10 @@ class DimensionDataNodeDriver(NodeDriver):
         :return: an instance of `DimensionDataVlan`
         :rtype: :class:`DimensionDataVlan`
         """
-        locations = self.list_locations()
+
         vlan = self.connection.request_with_orgId_api_2(
             'network/vlan/%s' % vlan_id).object
-        return self._to_vlan(vlan, locations)
+        return self._to_vlan(vlan)
 
     def ex_update_vlan(self, vlan):
         """
@@ -1819,10 +1827,9 @@ class DimensionDataNodeDriver(NodeDriver):
         return self._to_ip_blocks(response)
 
     def ex_get_public_ip_block(self, block_id):
-        locations = self.list_locations()
         block = self.connection.request_with_orgId_api_2(
             'network/publicIpBlock/%s' % block_id).object
-        return self._to_ip_block(block, locations)
+        return self._to_ip_block(block)
 
     def ex_delete_public_ip_block(self, block):
         delete_node = ET.Element('removePublicIpBlock', {'xmlns': TYPES_URN})
@@ -2111,10 +2118,9 @@ class DimensionDataNodeDriver(NodeDriver):
         return response_code in ['IN_PROGRESS', 'OK']
 
     def ex_get_firewall_rule(self, network_domain, rule_id):
-        locations = self.list_locations()
         rule = self.connection.request_with_orgId_api_2(
             'network/firewallRule/%s' % rule_id).object
-        return self._to_firewall_rule(rule, locations, network_domain)
+        return self._to_firewall_rule(rule, network_domain)
 
     def ex_set_firewall_rule_state(self, rule, state):
         """
@@ -4102,17 +4108,82 @@ class DimensionDataNodeDriver(NodeDriver):
         lines = str.splitlines(ensure_string(text))
         return [line.split(',') for line in lines]
 
-    @staticmethod
-    def _get_tagging_asset_type(asset):
-        objecttype = type(asset)
-        if objecttype.__name__ in OBJECT_TO_TAGGING_ASSET_TYPE_MAP:
-            return OBJECT_TO_TAGGING_ASSET_TYPE_MAP[objecttype.__name__]
-        raise TypeError("Asset type %s cannot be tagged" % objecttype.__name__)
-
     def _list_nodes_single_page(self, params={}):
         nodes = self.connection.request_with_orgId_api_2(
             'server/server', params=params).object
         return nodes
+
+    def _have_cached_location(self, location_id):
+        '''
+        Determine whether the specified location is
+        present in the location cache.
+
+        :param location_id: The target location Id.
+        :type location_id: ``str``
+
+        :return: True, if the location is present
+                 in the cache; otherwise, False.
+        :rtype: ``bool``.
+        '''
+
+        return location_id in self._location_cache
+
+    def _get_cached_location(self, location_id):
+        '''
+        Get the cached location with the specified Id,
+        populating the cache if required.
+
+        :param location_id: The target location Id.
+        :type location_id: ``str``
+
+        :return: The cached ``NodeLocation``.
+        :rtype: ``NodeLocation``.
+
+        :raises KeyError: The location does not exist, or the current user's
+                          organisation does not have access to the
+                          datacenter corresponding to that location.
+        '''
+
+        self._ensure_location_cache()
+
+        location = self._location_cache.get(location_id)
+        if location:
+            return location
+
+        raise KeyError(
+            'Location not found with Id "{0}"'.format(
+                location_id
+            ) + '(either the location does not exist, or the current user\'s' +
+            'organisation does not have access to this datacenter.'
+        )
+
+    def _ensure_location_cache(self):
+        '''
+        Ensure that the location cache has been populated.
+        '''
+
+        if not self._location_cache:
+            self.list_locations()  # Implicitly populates the cache.
+
+    def _populate_location_cache(self, locations):
+        '''
+        Clear and re-populate the location cache.
+
+        :param locations: The list of ``NodeLocation``s to cache.
+        :type locations: ``list``
+        '''
+
+        self._flush_location_cache()
+
+        for location in locations:
+            self._location_cache[location.id] = location
+
+    def _flush_location_cache(self):
+        '''
+        Remove all locations from the location cache.
+        '''
+
+        self._location_cache.clear()
 
     def _to_tags(self, object):
         tags = []
@@ -4159,29 +4230,26 @@ class DimensionDataNodeDriver(NodeDriver):
 
     def _to_images(self, object, el_name='osImage'):
         images = []
-        locations = self.list_locations()
 
         # The CloudControl API will return all images
         # in the current geographic region (even ones in
         # datacenters the user's organisation does not have access to)
         #
         # We therefore need to filter out those images (since we can't
-        # get a NodeLocation for them)
-        location_ids = set(location.id for location in locations)
+        # get a NodeLocation for them).
+        self._ensure_location_cache()
 
         for element in object.findall(fixxpath(el_name, TYPES_URN)):
             location_id = element.get('datacenterId')
-            if location_id in location_ids:
-                images.append(self._to_image(element, locations))
+            if self._have_cached_location(location_id):
+                images.append(self._to_image(element))
 
         return images
 
-    def _to_image(self, element, locations=None):
+    def _to_image(self, element):
         location_id = element.get('datacenterId')
-        if locations is None:
-            locations = self.list_locations(location_id)
+        location = self._get_cached_location(location_id)
 
-        location = [loc for loc in locations if loc.id == location_id][0]
         cpu_spec = self._to_cpu_spec(element.find(fixxpath('cpu', TYPES_URN)))
 
         if LooseVersion(self.connection.active_api_version) > LooseVersion(
@@ -4245,17 +4313,16 @@ class DimensionDataNodeDriver(NodeDriver):
 
     def _to_firewall_rules(self, object, network_domain):
         rules = []
-        locations = self.list_locations()
+
         for element in findall(object, 'firewallRule', TYPES_URN):
             rules.append(
-                self._to_firewall_rule(element, locations, network_domain))
+                self._to_firewall_rule(element, network_domain))
 
         return rules
 
-    def _to_firewall_rule(self, element, locations, network_domain):
+    def _to_firewall_rule(self, element, network_domain):
         location_id = element.get('datacenterId')
-        location = list(filter(lambda x: x.id == location_id,
-                               locations))[0]
+        location = self._get_cached_location(location_id)
 
         return DimensionDataFirewallRule(
             id=element.get('id'),
@@ -4302,16 +4369,15 @@ class DimensionDataNodeDriver(NodeDriver):
 
     def _to_ip_blocks(self, object):
         blocks = []
-        locations = self.list_locations()
+
         for element in findall(object, 'publicIpBlock', TYPES_URN):
-            blocks.append(self._to_ip_block(element, locations))
+            blocks.append(self._to_ip_block(element))
 
         return blocks
 
-    def _to_ip_block(self, element, locations):
+    def _to_ip_block(self, element):
         location_id = element.get('datacenterId')
-        location = list(filter(lambda x: x.id == location_id,
-                               locations))[0]
+        location = self._get_cached_location(location_id)
 
         return DimensionDataPublicIpBlock(
             id=element.get('id'),
@@ -4325,13 +4391,13 @@ class DimensionDataNodeDriver(NodeDriver):
 
     def _to_networks(self, object):
         networks = []
-        locations = self.list_locations()
+
         for element in findall(object, 'network', NETWORK_NS):
-            networks.append(self._to_network(element, locations))
+            networks.append(self._to_network(element))
 
         return networks
 
-    def _to_network(self, element, locations):
+    def _to_network(self, element):
         multicast = False
         if findtext(element, 'multicast', NETWORK_NS) == 'true':
             multicast = True
@@ -4339,8 +4405,7 @@ class DimensionDataNodeDriver(NodeDriver):
         status = self._to_status(element.find(fixxpath('status', NETWORK_NS)))
 
         location_id = findtext(element, 'location', NETWORK_NS)
-        location = list(filter(lambda x: x.id == location_id,
-                               locations))[0]
+        location = self._get_cached_location(location_id)
 
         return DimensionDataNetwork(
             id=findtext(element, 'id', NETWORK_NS),
@@ -4355,16 +4420,15 @@ class DimensionDataNodeDriver(NodeDriver):
 
     def _to_network_domains(self, object):
         network_domains = []
-        locations = self.list_locations()
+
         for element in findall(object, 'networkDomain', TYPES_URN):
-            network_domains.append(self._to_network_domain(element, locations))
+            network_domains.append(self._to_network_domain(element))
 
         return network_domains
 
-    def _to_network_domain(self, element, locations):
+    def _to_network_domain(self, element):
         location_id = element.get('datacenterId')
-        location = list(filter(lambda x: x.id == location_id,
-                               locations))[0]
+        location = self._get_cached_location(location_id)
         plan = findtext(element, 'type', TYPES_URN)
         if plan is 'ESSENTIALS':
             plan_type = NetworkDomainServicePlan.ESSENTIALS
@@ -4380,16 +4444,14 @@ class DimensionDataNodeDriver(NodeDriver):
 
     def _to_vlans(self, object):
         vlans = []
-        locations = self.list_locations()
         for element in findall(object, 'vlan', TYPES_URN):
-            vlans.append(self._to_vlan(element, locations=locations))
+            vlans.append(self._to_vlan(element))
 
         return vlans
 
-    def _to_vlan(self, element, locations):
+    def _to_vlan(self, element):
         location_id = element.get('datacenterId')
-        location = list(filter(lambda x: x.id == location_id,
-                               locations))[0]
+        location = self._get_cached_location(location_id)
         ip_range = element.find(fixxpath('privateIpv4Range', TYPES_URN))
         ip6_range = element.find(fixxpath('ipv6Range', TYPES_URN))
         network_domain_el = element.find(
@@ -4661,6 +4723,13 @@ class DimensionDataNodeDriver(NodeDriver):
         if image.extra['isCustomerImage'] and image.extra['OS_type'] == 'UNIX':
             return False
         return True
+
+    @staticmethod
+    def _get_tagging_asset_type(asset):
+        objecttype = type(asset)
+        if objecttype.__name__ in OBJECT_TO_TAGGING_ASSET_TYPE_MAP:
+            return OBJECT_TO_TAGGING_ASSET_TYPE_MAP[objecttype.__name__]
+        raise TypeError("Asset type %s cannot be tagged" % objecttype.__name__)
 
     @staticmethod
     def _to_port(element):
